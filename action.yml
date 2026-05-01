@@ -1,0 +1,65 @@
+name: 'QuantumAPI Secrets'
+description: 'Fetch secrets from QuantumVault and expose them as masked environment variables.'
+author: 'QuantumAPI'
+branding:
+  icon: 'lock'
+  color: 'purple'
+
+inputs:
+  api-key:
+    description: 'QuantumAPI API key (qapi_sk_…). Use a GitHub secret. Required.'
+    required: true
+  secret-paths:
+    description: |
+      Newline-separated list of `ENV_VAR=secret-name` mappings. Lines starting
+      with `#` are comments. Example:
+
+        DB_PASSWORD=prod/db/password
+        STRIPE_KEY=prod/stripe/api_key
+    required: true
+  endpoint:
+    description: 'QuantumAPI endpoint (defaults to https://api.quantumapi.eu).'
+    required: false
+    default: 'https://api.quantumapi.eu'
+  export-env:
+    description: 'If true (default), values are written to $GITHUB_ENV. If false, values are only emitted as outputs.'
+    required: false
+    default: 'true'
+  secrets-file:
+    description: |
+      Optional absolute path. When set, fetched secrets are also written to this
+      file as `KEY=value` lines (one per line, mode 0600). It is the caller''s
+      responsibility to clean up this file after use.
+    required: false
+    default: ''
+  cache:
+    description: |
+      When `true`, results are memoized for the lifetime of the job by writing a
+      key to `$GITHUB_STATE`. A subsequent invocation in the same job that
+      requests the same set of paths will short-circuit and reuse the previously
+      fetched values from $GITHUB_ENV (cache is job-scoped, not pipeline-scoped).
+    required: false
+    default: 'false'
+
+outputs:
+  injected-vars:
+    description: 'Comma-separated list of environment variable names that were injected.'
+    value: ${{ steps.inject.outputs.injected-vars }}
+  cache-hit:
+    description: 'Set to `true` when a previous invocation in this job already fetched the same set of paths and the cache was reused.'
+    value: ${{ steps.inject.outputs.cache-hit }}
+
+runs:
+  using: 'composite'
+  steps:
+    - id: inject
+      shell: bash
+      env:
+        QAPI_API_KEY: ${{ inputs.api-key }}
+        QAPI_ENDPOINT: ${{ inputs.endpoint }}
+        QAPI_SECRET_PATHS: ${{ inputs.secret-paths }}
+        QAPI_EXPORT_ENV: ${{ inputs.export-env }}
+        QAPI_SECRETS_FILE: ${{ inputs.secrets-file }}
+        QAPI_CACHE: ${{ inputs.cache }}
+      run: |
+        ${{ github.action_path }}/inject-secrets.sh
