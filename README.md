@@ -5,7 +5,9 @@
 # QuantumAPI Secrets Action
 
 Fetch secrets from [QuantumVault](https://quantumapi.eu) and expose them as
-masked environment variables in your GitHub Actions workflow.
+masked environment variables in your GitHub Actions workflow, or **sign and
+verify release artifacts** with a QuantumAPI ML-DSA key (`mode: sign` /
+`mode: verify`, see [Sign and verify release artifacts](#sign-and-verify-release-artifacts)).
 
 > **Source of truth:** this action is developed in the QuantumAPI monorepo
 > under [`src/integrations/github-action/`](https://github.com/victorZKov/quantumapi/tree/main/src/integrations/github-action)
@@ -39,7 +41,7 @@ jobs:
 | Name           | Required | Default                     | Description                                                                                            |
 | -------------- | -------- | --------------------------- | ------------------------------------------------------------------------------------------------------ |
 | `api-key`      | yes      | —                           | QuantumAPI API key with `secrets:read` scope. Pass via `${{ secrets.QAPI_API_KEY }}`.                  |
-| `secret-paths` | yes      | —                           | Newline-separated list of `ENV_VAR=secret-name` mappings. Lines starting with `#` are comments.        |
+| `secret-paths` | secrets mode | —                         | Newline-separated list of `ENV_VAR=secret-name` mappings. Lines starting with `#` are comments.        |
 | `endpoint`     | no       | `https://api.quantumapi.eu` | API endpoint (override for self-hosted / on-prem deployments).                                         |
 | `export-env`   | no       | `true`                      | When `true`, values are written to `$GITHUB_ENV`. When `false`, they are still masked but not exported.|
 | `secrets-file` | no       | `''`                        | When set to an absolute path, fetched secrets are also written as `KEY=value` lines (mode 0600).       |
@@ -51,6 +53,97 @@ jobs:
 | ---------------- | ------------------------------------------------------------------------------------ |
 | `injected-vars`  | Comma-separated list of environment variable names that were injected (e.g. `A,B`).  |
 | `cache-hit`      | `true` when a previous step in this job already fetched the same set of paths.       |
+
+## Sign and verify release artifacts
+
+Set `mode: sign` in the build job to sign an artifact with a QuantumAPI ML-DSA
+key (ML-DSA-65 by default), and `mode: verify` in the deploy job to refuse
+anything that was not signed by that key. Like `qapi sign --file` /
+`qapi verify --file`, the action signs the **SHA-256 hash of the file**, so
+signatures made by the action verify with the CLI and vice versa. The
+signature file holds the base64 signature, the same format as
+`qapi sign --output`.
+
+| Input              | Mode          | Description                                                                              |
+| ------------------ | ------------- | ---------------------------------------------------------------------------------------- |
+| `mode`             | both          | `sign` or `verify` (default `secrets`).                                                  |
+| `api-key`          | both          | API key (GitHub secret). Masked in the log. See scopes below.                            |
+| `file`             | both          | Path of the file to sign / verify.                                                       |
+| `key-id`           | both          | UUID of the ML-DSA key in QuantumVault.                                                  |
+| `signature`        | verify        | Path of the signature file (or the raw base64 signature).                                |
+| `signature-output` | sign          | Where to write the signature. Default `<file>.sig`.                                      |
+| `algorithm`        | sign          | Optional `ML-DSA-44`, `ML-DSA-65` or `ML-DSA-87`. Default: the key's algorithm (ML-DSA-65). |
+
+Outputs: `signature-path` (sign: path of the written signature file) and
+`verified` (verify: `true`; on an invalid signature the step fails instead).
+
+### API key scope
+
+Use **separate, least-privilege keys** for the two sides:
+
+- the build job's key needs the `sign` scope (and access to the signing key);
+- the deploy job's key only needs `verify`.
+
+A key without the right scope fails the step with an annotation naming the
+missing scope (HTTP 403). Store keys as GitHub secrets, never in the workflow file.
+
+### Full workflow example
+
+```yaml
+name: release
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./build.sh            # produces dist/app.tar.gz
+
+      - name: Sign the release artifact
+        id: sign
+        uses: victorZKov/quantumapi-secrets-action@v1
+        with:
+          mode: sign
+          api-key: ${{ secrets.QAPI_SIGN_KEY }}      # scope: sign
+          key-id: ${{ vars.QAPI_SIGNING_KEY_ID }}
+          file: dist/app.tar.gz
+          # signature-output: dist/app.tar.gz.sig    # default
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: |
+            dist/app.tar.gz
+            ${{ steps.sign.outputs.signature-path }}
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release
+          path: release
+
+      - name: Verify the signature (fails the job if invalid)
+        uses: victorZKov/quantumapi-secrets-action@v1
+        with:
+          mode: verify
+          api-key: ${{ secrets.QAPI_VERIFY_KEY }}    # scope: verify
+          key-id: ${{ vars.QAPI_SIGNING_KEY_ID }}
+          file: release/app.tar.gz
+          signature: release/app.tar.gz.sig
+
+      - run: ./deploy.sh release/app.tar.gz          # only runs if verification passed
+```
+
+If the artifact was tampered with, or the signature does not match the key,
+the verify step ends with an error annotation such as
+`Invalid signature: release/app.tar.gz does not match the signature for key <id>. Do not deploy this artifact.`
+and the job fails, so later steps never run.
 
 ## Optional: write secrets to a file
 
@@ -77,7 +170,8 @@ If multiple steps in the same job need the same secrets, set `cache: true`. The 
 
 ## Security
 
-- The API key is registered as a GitHub Actions mask via `::add-mask::` as soon as the action starts.
+- The API key is registered as a GitHub Actions mask via `::add-mask::` as soon as the action starts (in every mode, before any other output).
+- In sign/verify mode only the file's SHA-256 digest leaves the runner; the file itself is never uploaded.
 - Each fetched secret value is also masked (`::add-mask::`) before it is exported, so it appears as `***` in any subsequent log output, regardless of the runner OS or shell.
 - The action never prints values; it only logs `[QuantumAPI] injected NAME from path ([MASKED])`.
 - Multi-line secrets are written using the `$GITHUB_ENV` heredoc form, so newlines are preserved.
@@ -88,10 +182,10 @@ If multiple steps in the same job need the same secrets, set `cache: true`. The 
 
 ## Tests
 
-Unit tests for the entrypoint live in `test/inject-secrets.bats`. They use a `curl` shim placed early on `$PATH` to exercise the parser offline. Run them with [`bats-core`](https://github.com/bats-core/bats-core):
+Unit tests live in `test/inject-secrets.bats` (secrets mode) and `test/sign-verify.bats` (sign/verify; needs `openssl`). They use a `curl` shim placed early on `$PATH` to exercise the parser offline. Run them with [`bats-core`](https://github.com/bats-core/bats-core):
 
 ```bash
-bats test/inject-secrets.bats
+bats test/inject-secrets.bats test/sign-verify.bats
 ```
 
 ## Backend endpoint dependency

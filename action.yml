@@ -1,5 +1,5 @@
 name: 'QuantumAPI Secrets'
-description: 'Fetch secrets from QuantumVault and expose them as masked environment variables.'
+description: 'Fetch QuantumVault secrets as masked environment variables, or sign and verify release artifacts with a QuantumAPI ML-DSA key.'
 author: 'QuantumAPI'
 branding:
   icon: 'lock'
@@ -7,8 +7,32 @@ branding:
 
 inputs:
   api-key:
-    description: 'QuantumAPI API key (qapi_sk_…). Use a GitHub secret. Required.'
+    description: 'QuantumAPI API key (qapi_sk_…). Use a GitHub secret. Required. Scopes: secrets:read (secrets mode), sign (sign), verify (verify).'
     required: true
+  mode:
+    description: '`secrets` (default, inject QuantumVault secrets), `sign` (sign a file) or `verify` (verify a file signature).'
+    required: false
+    default: 'secrets'
+  file:
+    description: 'sign/verify: path of the file whose SHA-256 hash is signed/verified (same as `qapi sign --file`).'
+    required: false
+    default: ''
+  key-id:
+    description: 'sign/verify: UUID of the QuantumAPI ML-DSA signing key.'
+    required: false
+    default: ''
+  signature:
+    description: 'verify: path of the signature file produced by sign (or the raw base64 signature).'
+    required: false
+    default: ''
+  signature-output:
+    description: 'sign: where to write the signature. Defaults to `<file>.sig`.'
+    required: false
+    default: ''
+  algorithm:
+    description: 'sign: optional ML-DSA-44 | ML-DSA-65 | ML-DSA-87. Empty uses the key''s default (ML-DSA-65).'
+    required: false
+    default: ''
   secret-paths:
     description: |
       Newline-separated list of `ENV_VAR=secret-name` mappings. Lines starting
@@ -16,7 +40,8 @@ inputs:
 
         DB_PASSWORD=prod/db/password
         STRIPE_KEY=prod/stripe/api_key
-    required: true
+    required: false
+    default: ''
   endpoint:
     description: 'QuantumAPI endpoint (defaults to https://api.quantumapi.eu).'
     required: false
@@ -42,6 +67,12 @@ inputs:
     default: 'false'
 
 outputs:
+  signature-path:
+    description: 'sign mode: path of the written signature file.'
+    value: ${{ steps.signverify.outputs.signature-path }}
+  verified:
+    description: 'verify mode: `true` when the signature is valid (the step fails otherwise).'
+    value: ${{ steps.signverify.outputs.verified }}
   injected-vars:
     description: 'Comma-separated list of environment variable names that were injected.'
     value: ${{ steps.inject.outputs.injected-vars }}
@@ -53,6 +84,7 @@ runs:
   using: 'composite'
   steps:
     - id: inject
+      if: ${{ inputs.mode == 'secrets' || inputs.mode == '' }}
       shell: bash
       env:
         QAPI_API_KEY: ${{ inputs.api-key }}
@@ -63,3 +95,23 @@ runs:
         QAPI_CACHE: ${{ inputs.cache }}
       run: |
         ${{ github.action_path }}/inject-secrets.sh
+    - id: signverify
+      if: ${{ inputs.mode == 'sign' || inputs.mode == 'verify' }}
+      shell: bash
+      env:
+        QAPI_MODE: ${{ inputs.mode }}
+        QAPI_API_KEY: ${{ inputs.api-key }}
+        QAPI_ENDPOINT: ${{ inputs.endpoint }}
+        QAPI_FILE: ${{ inputs.file }}
+        QAPI_KEY_ID: ${{ inputs.key-id }}
+        QAPI_SIGNATURE: ${{ inputs.signature }}
+        QAPI_SIGNATURE_OUTPUT: ${{ inputs.signature-output }}
+        QAPI_ALGORITHM: ${{ inputs.algorithm }}
+      run: |
+        ${{ github.action_path }}/sign-verify.sh
+    - name: Reject unknown mode
+      if: ${{ inputs.mode != 'secrets' && inputs.mode != '' && inputs.mode != 'sign' && inputs.mode != 'verify' }}
+      shell: bash
+      run: |
+        echo "::error title=QuantumAPI::Unsupported mode '${{ inputs.mode }}' (expected secrets, sign or verify)"
+        exit 1
